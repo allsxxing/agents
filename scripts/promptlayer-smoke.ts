@@ -17,6 +17,14 @@ import promptlayer from "promptlayer";
 
 const { PromptLayer } = promptlayer;
 
+// Node's global fetch (used by the PromptLayer SDK) ignores HTTPS_PROXY. In
+// sandboxes that require outbound traffic to go through an egress proxy, route
+// fetch through it so the SDK's requests aren't blocked. No-op when unset.
+if (process.env.HTTPS_PROXY) {
+  const { setGlobalDispatcher, ProxyAgent } = await import("undici");
+  setGlobalDispatcher(new ProxyAgent(process.env.HTTPS_PROXY));
+}
+
 const apiKey = process.env.PROMPTLAYER_API_KEY;
 if (!apiKey) {
   throw new Error(
