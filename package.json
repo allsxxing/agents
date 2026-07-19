@@ -89,7 +89,10 @@
     "site/*"
   ],
   "overrides": {
-    "esbuild": "^0.25.1"
+    "esbuild": "^0.25.1",
+    "promptlayer": {
+      "@openai/agents": "$@openai/agents"
+    }
   },
   "lint-staged": {
     "*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,astro,svelte,css}": [

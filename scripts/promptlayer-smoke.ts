@@ -24,6 +24,12 @@ if (!apiKey) {
   );
 }
 
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error(
+    "OPENAI_API_KEY is not set (add it to .dev.vars at the repo root) — the example prompt runs against gpt-4o."
+  );
+}
+
 const pl = new PromptLayer({ apiKey, throwOnError: true });
 
 const response = await pl.run({
@@ -35,7 +41,8 @@ const response = await pl.run({
   }
 });
 
-const { request_id: requestId } = response as { request_id?: number | null };
+const requestId = (response as { request_id?: number | null } | null)
+  ?.request_id;
 if (requestId == null) {
   throw new Error(
     "No request_id returned — check PROMPTLAYER_API_KEY / OPENAI_API_KEY and provider auth."
