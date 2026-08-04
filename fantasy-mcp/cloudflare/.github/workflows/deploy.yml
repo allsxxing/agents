@@ -1,0 +1,142 @@
+# CI deploy for nfl-mcp on Cloudflare (Worker + Container).
+#
+# Drops in at .github/workflows/deploy.yml in the allsxxing/nfl_mcp fork.
+# Bootstrap.sh copies it there — do not commit this to gtonic/nfl_mcp.
+#
+# On push to main it:
+#   1. Builds the container image from ./Dockerfile (GH Actions runners have
+#      Docker preinstalled — you don't need Docker locally).
+#   2. Runs `wrangler deploy`, which pushes the Worker + registers the
+#      Container Durable Object + uploads the image to Cloudflare's registry.
+#   3. Smokes the deployed URL: unauthenticated /health must 401,
+#      authenticated must 200. Fails the run on either miss.
+#
+# Required repo secrets (set once at github.com/allsxxing/nfl_mcp/settings/secrets/actions):
+#   - CLOUDFLARE_API_TOKEN — Workers-scoped API token from
+#     dash.cloudflare.com/profile/api-tokens → "Edit Cloudflare Workers"
+#     template. Keep it scoped to the one account.
+#   - CLOUDFLARE_ACCOUNT_ID — dash.cloudflare.com → right sidebar of any
+#     Workers page.
+#   - MCP_TOKEN — the bearer token clients will present. Generate once with
+#     `openssl rand -hex 32` and save in your password manager too.
+#
+# Optional:
+#   - ODDS_API_KEY — enables real Vegas lines; without it the tools return
+#     neutral placeholders.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-nfl-mcp
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install worker deps
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Push MCP_TOKEN to the Worker
+        # Piped in on stdin so it never lands in a logged argv or a temp file.
+        run: printf '%s' "$MCP_TOKEN" | npx wrangler secret put MCP_TOKEN
+        env:
+          MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Push ODDS_API_KEY (if provided)
+        if: ${{ secrets.ODDS_API_KEY != '' }}
+        run: printf '%s' "$ODDS_API_KEY" | npx wrangler secret put ODDS_API_KEY
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy worker + container
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # Wrangler prints "Deployed <name> triggers ... <url>" on success;
+          # grep the first https:// on a "triggers" line.
+          npx wrangler deploy 2>&1 | tee /tmp/wrangler.log
+          URL=$(grep -oE 'https://nfl-mcp\.[a-z0-9.-]+\.workers\.dev' /tmp/wrangler.log | head -1)
+          if [ -z "$URL" ]; then
+            echo "::error::Could not parse deployed URL from wrangler output"
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Deployed: $URL"
+
+      - name: Smoke — unauthenticated /health must 401
+        run: |
+          URL="${{ steps.deploy.outputs.url }}"
+          # Poll: container may need a moment to warm on first deploy.
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$URL/health" || echo 000)
+            [ "$CODE" != "000" ] && break
+            sleep 5
+          done
+          echo "unauthenticated /health -> $CODE"
+          if [ "$CODE" != "401" ]; then
+            echo "::error::Expected 401, got $CODE — endpoint may be open to the world"
+            exit 1
+          fi
+
+      - name: Smoke — authenticated /health must 200
+        env:
+          MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
+        run: |
+          URL="${{ steps.deploy.outputs.url }}"
+          for i in 1 2 3 4 5; do
+            RESP=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $MCP_TOKEN" "$URL/health" || printf '\n000')
+            CODE=$(printf '%s' "$RESP" | tail -1)
+            BODY=$(printf '%s' "$RESP" | sed '$d')
+            [ "$CODE" = "200" ] && break
+            sleep 5
+          done
+          echo "authenticated /health -> $CODE"
+          # Never log the token; only the body (which is public health JSON).
+          echo "body: $BODY"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Expected 200, got $CODE"
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## nfl-mcp deployed"
+            echo ""
+            echo "- URL: ${{ steps.deploy.outputs.url }}"
+            echo "- Auth: unauthenticated → 401 ✓, authenticated → 200 ✓"
+            echo ""
+            echo "Wire your clients:"
+            echo ""
+            echo '```bash'
+            echo 'claude mcp add --transport http nfl-mcp \'
+            echo "  ${{ steps.deploy.outputs.url }}/mcp/ \\"
+            echo '  --header "Authorization: Bearer <MCP_TOKEN from your password manager>"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

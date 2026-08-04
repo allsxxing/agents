@@ -10,9 +10,40 @@ tasks it covers.
 `allsxxing/nfl_mcp` fork exists yet. Do the fork on your machine, apply the
 two patches below, and continue.
 
+## TL;DR — three commands to finished
+
+If you just want it done, skip the task-by-task walk-through and run these:
+
+```bash
+# 1. Fork + clone + apply patches + drop deploy scaffold (one command).
+./scripts/bootstrap.sh                          # defaults to ~/Projects/fantasy
+
+# 2. Set 3 GitHub secrets at
+#    https://github.com/allsxxing/nfl_mcp/settings/secrets/actions
+#      CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, MCP_TOKEN
+# Then push and let CI deploy:
+cd ~/Projects/fantasy/nfl_mcp
+git push -u origin feat/tool-allowlist
+# Open a PR from feat/tool-allowlist -> main, merge it. The merge triggers
+# .github/workflows/deploy.yml on GitHub Actions. No Docker needed on your
+# machine — the runner builds the image, deploys the Worker + Container,
+# and runs the 401/200 smoke test. Copy the *.workers.dev URL from the run.
+
+# 3. Wire both clients + install the skills.
+./scripts/wire-clients.sh https://nfl-mcp.<subdomain>.workers.dev
+```
+
+That runs Plan Tasks 1, 3, 4, 5, 6, 7, 9 for you. Only Task 2 (Flaim skill,
+included in step 3 above if you've also cloned `jdguggs10/flaim`) and Task 8
+(flaim.app `defaultSport`/`defaultLeague`, a dashboard toggle) are left as
+manual touches.
+
 ```
 fantasy-mcp/
 ├── README.md                        (this file)
+├── scripts/                         → automates Tasks 1, 2, 6
+│   ├── bootstrap.sh                 fork+clone+patches+scaffold
+│   └── wire-clients.sh              wire Claude Code + Desktop, install skills
 ├── nfl_mcp-patches/                 → Task 3, Task 9
 │   ├── 0001-feat-add-NFL_MCP_DISABLED_TOOLS-registration-allowli.patch
 │   └── 0002-test-evals-add-offline-routing-guard-for-the-tool-al.patch
@@ -20,7 +51,8 @@ fantasy-mcp/
 │   ├── wrangler.jsonc
 │   ├── worker/index.ts
 │   ├── package.json
-│   └── tsconfig.json
+│   ├── tsconfig.json
+│   └── .github/workflows/deploy.yml  CI-driven deploy + auth smoke test
 └── skills/fantasy-routing/          → Task 7
     └── SKILL.md
 ```
