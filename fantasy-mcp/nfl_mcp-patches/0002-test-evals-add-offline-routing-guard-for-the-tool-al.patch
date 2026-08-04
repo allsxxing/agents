@@ -1,0 +1,263 @@
+From 2d4ba2b84af4f41d604487a46d1b00b86a60d768 Mon Sep 17 00:00:00 2001
+From: GJ Bordallo <gjbordallo@icloud.com>
+Date: Tue, 4 Aug 2026 07:39:44 +0000
+Subject: [PATCH 2/2] test(evals): add offline routing guard for the tool
+ allowlist
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The live agent eval needs ANTHROPIC_API_KEY. These checks are pure and
+free, and run with `pytest evals/agent -q`.
+
+They validate the scenario set against the live registry (expected tools
+exist, asserted args are real parameters) and pin the allowlist's effect:
+analytics scenarios must stay routable when the duplicate league-state
+tools are suppressed, and scenarios marked lane="league_state" must have
+ALL their tools suppressed so the two servers can't both answer.
+
+Adds analytics scenarios (draft board variants, projections, SoS,
+streaming, weather) and marks find_leagues as league_state — its only
+tools, get_user/get_user_leagues, are both on the duplicate list.
+---
+ evals/agent/scenarios.py          |  68 +++++++++++++++
+ evals/agent/test_routing_guard.py | 135 ++++++++++++++++++++++++++++++
+ 2 files changed, 203 insertions(+)
+ create mode 100644 evals/agent/test_routing_guard.py
+
+diff --git a/evals/agent/scenarios.py b/evals/agent/scenarios.py
+index d3ad062..aab4559 100644
+--- a/evals/agent/scenarios.py
++++ b/evals/agent/scenarios.py
+@@ -4,8 +4,27 @@ Each scenario is a realistic user prompt plus the tool(s) a good assistant shoul
+ call. ``expect`` is an *any-of* list (several tools can be reasonable). ``args``
+ optionally asserts the model extracted an obvious argument — value ``None`` means
+ "just present".
++
++``lane`` marks which server owns the question when this one is deployed next to a
++league-state MCP server (see NFL_MCP_DISABLED_TOOLS). Scenarios without a ``lane``
++are analytics — this server's job, and they must stay routable with the duplicate
++league-state tools suppressed. ``lane="league_state"`` marks the opposite: every
++expected tool is a duplicate, so with the allowlist active the *other* server
++answers it. ``test_routing_guard.py`` enforces both directions offline.
+ """
+ 
++# Sleeper league-state tools that duplicate a companion league-state MCP server.
++# Suppressing these is the intended deployment for a side-by-side setup:
++#   NFL_MCP_DISABLED_TOOLS="get_league,get_rosters,get_matchups,..."
++LEAGUE_STATE_DUPLICATES = {
++    "get_league",
++    "get_rosters",
++    "get_matchups",
++    "get_transactions",
++    "get_user",
++    "get_user_leagues",
++}
++
+ SCENARIOS = [
+     # --- Drafting -----------------------------------------------------------
+     {
+@@ -86,10 +105,59 @@ SCENARIOS = [
+         "id": "find_leagues",
+         "prompt": "My Sleeper username is gridiron_gary — find my leagues for the 2026 season.",
+         "expect": ["get_user", "get_user_leagues"],
++        # Pure league lookup: the companion league-state server owns this when
++        # the duplicate tools are suppressed here.
++        "lane": "league_state",
+     },
+     {
+         "id": "stacks",
+         "prompt": "Which games this week are best for a QB + WR stack?",
+         "expect": ["get_stack_opportunities", "get_vegas_lines"],
+     },
++    # --- Analytics lane: must stay routable with duplicates suppressed -------
++    # These exist specifically to prove the allowlist doesn't strand the
++    # analytics questions this server is deployed to answer.
++    {
++        "id": "draft_board_superflex",
++        "prompt": "Give me a superflex draft board for a 10-team half-PPR league, top 40 players.",
++        "expect": ["get_draft_board"],
++        "args": {"superflex": True, "num_teams": 10},
++    },
++    {
++        "id": "draft_board_position",
++        "prompt": "Show me the top running backs on the draft board for a 12-team PPR league.",
++        "expect": ["get_draft_board"],
++        "args": {"position": "RB"},
++    },
++    {
++        "id": "draft_pick_from_league_drafts",
++        "prompt": "Which drafts are set up in Sleeper league 555?",
++        "expect": ["get_league_drafts"],
++        "args": {"league_id": "555"},
++    },
++    {
++        "id": "project_single_player",
++        "prompt": "Project Puka Nacua's points for week 5 in a PPR league.",
++        "expect": ["project_player", "project_players"],
++    },
++    {
++        "id": "strength_of_schedule",
++        "prompt": "Which running backs have the easiest rest-of-season schedule?",
++        "expect": ["get_strength_of_schedule"],
++    },
++    {
++        "id": "playoff_sos",
++        "prompt": "Whose schedule is best during the fantasy playoff weeks 15 through 17?",
++        "expect": ["get_playoff_sos", "get_strength_of_schedule"],
++    },
++    {
++        "id": "streaming_dst",
++        "prompt": "Who are the best streaming defense options this week?",
++        "expect": ["get_streaming_options"],
++    },
++    {
++        "id": "weather",
++        "prompt": "Is wind going to be a problem for any game this week?",
++        "expect": ["get_weather_forecast"],
++    },
+ ]
+diff --git a/evals/agent/test_routing_guard.py b/evals/agent/test_routing_guard.py
+new file mode 100644
+index 0000000..85ca4cd
+--- /dev/null
++++ b/evals/agent/test_routing_guard.py
+@@ -0,0 +1,135 @@
++"""Offline guard for the agent routing eval.
++
++The live eval in ``run.py`` needs ANTHROPIC_API_KEY and costs money. These checks
++are pure and free: they validate the *scenario set itself* against the live tool
++registry, and pin the behaviour of NFL_MCP_DISABLED_TOOLS for a side-by-side
++deployment (this server for analytics, a companion server for league state).
++
++Run: pytest evals/agent -q
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from .scenarios import LEAGUE_STATE_DUPLICATES, SCENARIOS
++from .tools import anthropic_tools_from_registry, registry_tool_names
++
++
++@pytest.fixture
++def all_tools(monkeypatch):
++    """Registry with no allowlist applied."""
++    monkeypatch.delenv("NFL_MCP_DISABLED_TOOLS", raising=False)
++    return registry_tool_names()
++
++
++@pytest.fixture
++def analytics_tools(monkeypatch):
++    """Registry as deployed beside a league-state server."""
++    monkeypatch.setenv("NFL_MCP_DISABLED_TOOLS", ",".join(sorted(LEAGUE_STATE_DUPLICATES)))
++    return registry_tool_names()
++
++
++# --- scenario hygiene ------------------------------------------------------
++
++
++def test_scenario_ids_unique():
++    ids = [sc["id"] for sc in SCENARIOS]
++    assert len(ids) == len(set(ids)), "duplicate scenario id"
++
++
++def test_every_expected_tool_exists(all_tools):
++    """Catches typos and tools renamed out from under the scenario set."""
++    unknown = {
++        (sc["id"], name)
++        for sc in SCENARIOS
++        for name in sc["expect"]
++        if name not in all_tools
++    }
++    assert not unknown, f"scenarios expect non-existent tools: {sorted(unknown)}"
++
++
++def test_every_scenario_has_expectations():
++    for sc in SCENARIOS:
++        assert sc.get("expect"), f"{sc['id']} has no expected tools"
++        assert sc.get("prompt"), f"{sc['id']} has no prompt"
++
++
++def test_expected_args_are_real_parameters(all_tools):
++    """An asserted arg must actually be a parameter of some expected tool."""
++    schemas = {t["name"]: t["input_schema"]["properties"] for t in anthropic_tools_from_registry()}
++    bad = []
++    for sc in SCENARIOS:
++        for arg in (sc.get("args") or {}):
++            if not any(arg in schemas.get(name, {}) for name in sc["expect"]):
++                bad.append((sc["id"], arg))
++    assert not bad, f"scenarios assert args no expected tool accepts: {bad}"
++
++
++# --- allowlist behaviour ---------------------------------------------------
++
++
++def test_duplicates_are_real_tools(all_tools):
++    """The suppression list must name tools that actually exist, or it's a no-op."""
++    assert all_tools >= LEAGUE_STATE_DUPLICATES
++
++
++def test_allowlist_removes_exactly_the_duplicates(all_tools, analytics_tools):
++    assert all_tools - analytics_tools == LEAGUE_STATE_DUPLICATES
++
++
++def test_analytics_scenarios_survive_the_allowlist(analytics_tools):
++    """Every analytics scenario keeps at least one routable tool.
++
++    This is the regression that matters: suppressing league-state tools must
++    never strand a question this server is deployed to answer.
++    """
++    stranded = [
++        sc["id"]
++        for sc in SCENARIOS
++        if sc.get("lane") != "league_state"
++        and not (set(sc["expect"]) & analytics_tools)
++    ]
++    assert not stranded, f"allowlist stranded analytics scenarios: {stranded}"
++
++
++def test_league_state_scenarios_are_fully_delegated(analytics_tools):
++    """A scenario marked league_state must have *all* its tools suppressed.
++
++    If one survives, the model can still answer it here and the two servers
++    will disagree — the exact ambiguity the allowlist exists to remove.
++    """
++    for sc in SCENARIOS:
++        if sc.get("lane") == "league_state":
++            leaked = set(sc["expect"]) & analytics_tools
++            assert not leaked, f"{sc['id']} still routable here via {sorted(leaked)}"
++
++
++def test_no_analytics_scenario_expects_a_duplicate():
++    """Analytics scenarios must not depend on a tool we suppress in production."""
++    offenders = [
++        (sc["id"], sorted(set(sc["expect"]) & LEAGUE_STATE_DUPLICATES))
++        for sc in SCENARIOS
++        if sc.get("lane") != "league_state" and set(sc["expect"]) & LEAGUE_STATE_DUPLICATES
++    ]
++    assert not offenders, f"analytics scenarios expect suppressed tools: {offenders}"
++
++
++def test_draft_tools_survive_the_allowlist(analytics_tools):
++    """Draft capability is the whole point of the side-by-side deployment."""
++    assert {
++        "get_draft_board",
++        "recommend_draft_pick",
++        "simulate_draft",
++        "get_league_drafts",
++        "get_draft",
++        "get_draft_picks",
++    } <= analytics_tools
++
++
++def test_tool_schemas_build_under_allowlist(analytics_tools):
++    """Schema generation must not blow up on the filtered registry."""
++    tools = anthropic_tools_from_registry()
++    assert {t["name"] for t in tools} == analytics_tools
++    for t in tools:
++        assert t["description"], f"{t['name']} has an empty description"
+-- 
+2.43.0
+
