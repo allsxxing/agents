@@ -1,0 +1,51 @@
+{
+  // Deploy from the ROOT of the nfl_mcp fork (the Dockerfile must be in the
+  // build context). Copy this file and worker/ there, then `wrangler deploy`.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nfl-mcp",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": { "enabled": true },
+
+  // Non-secret runtime config. The Worker forwards these into the container
+  // via the Container class's envVars (see worker/index.ts) — Worker vars do
+  // NOT reach the container process on their own.
+  "vars": {
+    // The six Sleeper league-state tools Flaim already answers. Suppressing
+    // them here stops the model seeing two tools for the same question.
+    "NFL_MCP_DISABLED_TOOLS": "get_league,get_rosters,get_matchups,get_transactions,get_user,get_user_leagues",
+    "NFL_MCP_ADVANCED_ENRICH": "1"
+    // NFL_MCP_PREFETCH intentionally omitted — see worker/index.ts.
+    // ODDS_API_KEY is a secret, not a var: `wrangler secret put ODDS_API_KEY`.
+  },
+
+  "containers": [
+    {
+      "class_name": "NflMcpContainer",
+      "image": "./Dockerfile",
+      // One shared analytics backend. Raise only if concurrent drafts overlap.
+      "max_instances": 1
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NFL_MCP",
+        "class_name": "NflMcpContainer"
+      }
+    ]
+  },
+
+  // Required when introducing a new Durable Object class. Without this,
+  // `wrangler deploy` fails with "Cannot create binding for class ... because
+  // it is not currently defined". Do not renumber the tag after deploying.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NflMcpContainer"]
+    }
+  ]
+}
